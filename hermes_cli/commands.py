@@ -295,6 +295,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                             "notify-list", "notify-unsubscribe", "log", "runs",
                             "heartbeat", "assignees", "context", "specify", "gc"),
                busy_policy="dispatch"),
+    CommandDef("kanban_status", "Show live Kanban status across active boards", "Tools & Skills",
+               gateway_only=True, aliases=("kanban-status",)),
+    CommandDef("newtask", "Start guided dev-team project task intake", "Tools & Skills",
+               gateway_only=True),
     CommandDef("reload", "Reload .env variables into the running session", "Tools & Skills",
                cli_only=True),
     CommandDef("reload-mcp", "Reload MCP servers from config", "Tools & Skills",
@@ -658,6 +662,8 @@ _TELEGRAM_MENU_PRIORITY = (
     "update",
     "verbose",
     "commands",
+    "kanban_status",
+    "newtask",
     # Mid-turn session control.
     "approve",
     "deny",
@@ -1277,7 +1283,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     native slash.
 #   - pause: global emergency stop; reached via /hermes pause [off] on
 #     Slack. Added at the 50-cap — a native slot would clamp /platform.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause"})
+#   - insights/platform: low-frequency diagnostics/recovery surfaces. Demoted
+#     when the dev-team /kanban_status and /newtask gateway commands claimed
+#     native slots; both remain reachable as /hermes insights and /hermes platform.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "insights", "platform"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
