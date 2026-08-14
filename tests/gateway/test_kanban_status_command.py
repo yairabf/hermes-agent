@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -19,7 +21,9 @@ def test_kanban_status_command_is_gateway_registered():
     assert is_gateway_known_command("kanban_status") is True
 
 
-def test_kanban_status_report_includes_active_boards_and_grouped_tasks(monkeypatch, tmp_path):
+def test_kanban_status_report_includes_active_boards_and_grouped_tasks(
+    monkeypatch, tmp_path
+):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
@@ -47,7 +51,9 @@ def test_kanban_status_report_includes_active_boards_and_grouped_tasks(monkeypat
             initial_status="blocked",
             board="yair-general",
         )
-        kb.add_comment(conn, blocked_id, "reviewer", "review-required: needs eyes before merge")
+        kb.add_comment(
+            conn, blocked_id, "reviewer", "review-required: needs eyes before merge"
+        )
         conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (ready_id,))
         conn.commit()
 
@@ -97,13 +103,369 @@ def test_kanban_status_report_cleans_task_id_before_inline_code():
     assert "`t_bad`id<raw>" not in report
 
 
+def test_kanban_status_report_shows_done_completion_date_and_age():
+    from gateway.kanban_status import BoardReport, render_kanban_status_report
+
+    local_tz = timezone(timedelta(hours=3))
+    now = datetime(2026, 8, 14, 12, 0, tzinfo=local_tz)
+    completed = datetime(2026, 7, 15, 12, 0, tzinfo=local_tz)
+    task = SimpleNamespace(
+        id="t_done",
+        title="Finished task",
+        assignee="coder",
+        priority=0,
+        tenant=None,
+        status="done",
+        created_at=completed.timestamp() - 86_400,
+        started_at=None,
+        completed_at=completed.timestamp(),
+    )
+
+    report = render_kanban_status_report(
+        reports=[
+            BoardReport(
+                slug="demo",
+                name="Demo",
+                task_count=1,
+                counts=Counter({"done": 1}),
+                sections={"done": [task]},
+            )
+        ],
+        now=now,
+        max_chars=20_000,
+    )
+
+    assert "completed: 2026-07-15 • 30d ago" in report
+
+
+def test_kanban_status_report_uses_relevant_dates_for_active_statuses():
+    from gateway.kanban_status import BoardReport, render_kanban_status_report
+
+    local_tz = timezone(timedelta(hours=3))
+    now = datetime(2026, 8, 14, 12, 0, tzinfo=local_tz)
+
+    def task(task_id, status, *, created_days, started_hours=None):
+        return SimpleNamespace(
+            id=task_id,
+            title=task_id,
+            assignee="coder",
+            priority=0,
+            tenant=None,
+            status=status,
+            created_at=(now - timedelta(days=created_days)).timestamp(),
+            started_at=(now - timedelta(hours=started_hours)).timestamp()
+            if started_hours is not None
+            else None,
+            completed_at="not-a-timestamp",
+        )
+
+    tasks = [
+        task("t_running", "running", created_days=5, started_hours=2),
+        task("t_running_fallback", "running", created_days=3),
+        task("t_scheduled", "scheduled", created_days=4),
+        task("t_ready", "ready", created_days=5),
+    ]
+    sections: dict[str, list[object]] = {
+        status: [item for item in tasks if item.status == status]
+        for status in {str(t.status) for t in tasks}
+    }
+    report = render_kanban_status_report(
+        reports=[
+            BoardReport(
+                slug="demo",
+                name="Demo",
+                task_count=len(tasks),
+                counts=Counter(t.status for t in tasks),
+                sections=sections,
+            )
+        ],
+        now=now,
+        max_chars=20_000,
+    )
+
+    assert "started: 2026-08-14 • 2h ago" in report
+    assert "created: 2026-08-11 • 3d ago" in report
+    assert "created: 2026-08-10 • 4d ago" in report
+    assert "created: 2026-08-09 • 5d ago" in report
+
+
+def test_done_retention_boundary_uses_elapsed_hours_across_dst():
+    from gateway.kanban_status import _should_archive_done_task
+
+    local_tz = ZoneInfo("America/New_York")
+    now = datetime(2026, 4, 1, 12, 0, tzinfo=local_tz)
+    exact_boundary = SimpleNamespace(
+        status="done",
+        completed_at=now.timestamp() - (30 * 24 * 60 * 60),
+    )
+    one_second_older = SimpleNamespace(
+        status="done",
+        completed_at=exact_boundary.completed_at - 1,
+    )
+
+    assert _should_archive_done_task(exact_boundary, now=now) is False
+    assert _should_archive_done_task(one_second_older, now=now) is True
+
+
+def test_compact_age_uses_elapsed_time_across_dst():
+    from gateway.kanban_status import _compact_age
+
+    local_tz = ZoneInfo("America/New_York")
+    now = datetime(2026, 3, 8, 4, 0, tzinfo=local_tz)
+    two_hours_ago = datetime.fromtimestamp(now.timestamp() - (2 * 60 * 60), tz=local_tz)
+
+    assert _compact_age(two_hours_ago, now=now) == "2h ago"
+
+
+def test_invalid_out_of_range_timestamp_stays_visible_without_crashing(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    from hermes_cli import kanban_db as kb
+    from gateway.kanban_status import (
+        collect_kanban_status_data,
+        render_kanban_status_report,
+    )
+
+    kb.create_board("invalid-time", name="Invalid Time")
+    with kb.connect_closing(board="invalid-time") as conn:
+        task_id = kb.create_task(
+            conn, title="Invalid completion", assignee="coder", board="invalid-time"
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+            (1e308, task_id),
+        )
+
+    reports = {report.slug: report for report in collect_kanban_status_data()}
+    rendered = render_kanban_status_report(list(reports.values()))
+
+    assert reports["invalid-time"].error is None
+    assert task_id in {
+        task.id for tasks in reports["invalid-time"].sections.values() for task in tasks
+    }
+    assert "Invalid completion" in rendered
+
+
+def test_kanban_status_archives_only_done_tasks_strictly_older_than_retention(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    from hermes_cli import kanban_db as kb
+    from gateway.kanban_status import (
+        collect_kanban_status_data,
+        render_kanban_status_report,
+    )
+
+    now = datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc)
+    kb.create_board("retention", name="Retention")
+    with kb.connect_closing(board="retention") as conn:
+        expired_id = kb.create_task(
+            conn, title="Expired Done", assignee="coder", board="retention"
+        )
+        boundary_id = kb.create_task(
+            conn, title="Boundary Done", assignee="coder", board="retention"
+        )
+        missing_id = kb.create_task(
+            conn, title="Missing Completion", assignee="coder", board="retention"
+        )
+        blocked_id = kb.create_task(
+            conn,
+            title="Old Blocked",
+            assignee="coder",
+            initial_status="blocked",
+            board="retention",
+        )
+        already_archived_id = kb.create_task(
+            conn, title="Already Archived", assignee="coder", board="retention"
+        )
+        conn.executemany(
+            "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+            [
+                ((now - timedelta(days=31)).timestamp(), expired_id),
+                ((now - timedelta(days=30)).timestamp(), boundary_id),
+                (None, missing_id),
+            ],
+        )
+        conn.execute(
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            ((now - timedelta(days=31)).timestamp(), blocked_id),
+        )
+        kb.archive_task(conn, already_archived_id)
+
+    reports = {report.slug: report for report in collect_kanban_status_data(now=now)}
+    shown_ids = {
+        task.id for tasks in reports["retention"].sections.values() for task in tasks
+    }
+
+    assert expired_id not in shown_ids
+    assert boundary_id in shown_ids
+    assert missing_id in shown_ids
+    assert blocked_id in shown_ids
+    assert already_archived_id not in shown_ids
+    assert reports["retention"].counts["done"] == 2
+    rendered = render_kanban_status_report(list(reports.values()), now=now)
+    assert "Missing Completion" in rendered
+    assert (
+        "completed: 2026" in rendered
+    )  # Boundary task still has a valid completion date.
+    with kb.connect_closing(board="retention") as conn:
+        stored = {task.id: task for task in kb.list_tasks(conn, include_archived=True)}
+        assert stored[expired_id].status == "archived"
+        assert stored[boundary_id].status == "done"
+        assert stored[missing_id].status == "done"
+        assert stored[blocked_id].status != "archived"
+        assert [event.kind for event in kb.list_events(conn, expired_id)].count(
+            "archived"
+        ) == 1
+
+
+def test_kanban_status_cleanup_failure_warns_and_continues(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    from hermes_cli import kanban_db as kb
+    from gateway.kanban_status import (
+        collect_kanban_status_data,
+        render_kanban_status_report,
+    )
+
+    now = datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc)
+    expired_at = (now - timedelta(days=31)).timestamp()
+    ids = {}
+    for board in ("failing", "healthy"):
+        kb.create_board(board, name=board.title())
+        with kb.connect_closing(board=board) as conn:
+            ids[board] = kb.create_task(
+                conn, title=f"{board} expired", assignee="coder", board=board
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                (expired_at, ids[board]),
+            )
+    with kb.connect_closing(board="failing") as conn:
+        ids["failing-second"] = kb.create_task(
+            conn, title="second expired", assignee="coder", board="failing"
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+            (expired_at, ids["failing-second"]),
+        )
+
+    real_archive_task = kb.archive_task
+
+    def selective_failure(conn, task_id, **kwargs):
+        if task_id == ids["failing"]:
+            raise RuntimeError("unsafe <cleanup>\nfailed")
+        return real_archive_task(conn, task_id, **kwargs)
+
+    monkeypatch.setattr(kb, "archive_task", selective_failure)
+    reports = {report.slug: report for report in collect_kanban_status_data(now=now)}
+    rendered = render_kanban_status_report(list(reports.values()), now=now)
+
+    assert reports["failing"].error is None
+    assert reports["failing"].warning
+    assert ids["failing"] in {
+        task.id for tasks in reports["failing"].sections.values() for task in tasks
+    }
+    assert ids["failing-second"] not in {
+        task.id for tasks in reports["failing"].sections.values() for task in tasks
+    }
+    assert reports["healthy"].task_count == 0
+    assert "Could not archive 1 expired Done task(s)" in rendered
+    assert "‹cleanup› failed" in rendered
+    assert "<cleanup>\nfailed" not in rendered
+
+
+def test_kanban_status_cleanup_is_idempotent(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    from hermes_cli import kanban_db as kb
+    from gateway.kanban_status import collect_kanban_status_data
+
+    now = datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc)
+    kb.create_board("repeat", name="Repeat")
+    with kb.connect_closing(board="repeat") as conn:
+        task_id = kb.create_task(
+            conn, title="Expired", assignee="coder", board="repeat"
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+            ((now - timedelta(days=31)).timestamp(), task_id),
+        )
+
+    first = {report.slug: report for report in collect_kanban_status_data(now=now)}
+    second = {report.slug: report for report in collect_kanban_status_data(now=now)}
+
+    assert first["repeat"].task_count == 0
+    assert second["repeat"].task_count == 0
+    assert first["repeat"].warning is None
+    assert second["repeat"].warning is None
+    with kb.connect_closing(board="repeat") as conn:
+        assert [event.kind for event in kb.list_events(conn, task_id)].count(
+            "archived"
+        ) == 1
+
+
+def test_kanban_status_does_not_archive_task_changed_from_done_concurrently(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    from hermes_cli import kanban_db as kb
+    from gateway.kanban_status import collect_kanban_status_data
+
+    now = datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc)
+    kb.create_board("race", name="Race")
+    with kb.connect_closing(board="race") as conn:
+        task_id = kb.create_task(
+            conn, title="Racing task", assignee="coder", board="race"
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+            ((now - timedelta(days=31)).timestamp(), task_id),
+        )
+
+    real_archive_task = kb.archive_task
+
+    def move_before_archive(conn, candidate_id, **kwargs):
+        conn.execute(
+            "UPDATE tasks SET status = 'running' WHERE id = ?", (candidate_id,)
+        )
+        conn.commit()
+        return real_archive_task(conn, candidate_id, **kwargs)
+
+    monkeypatch.setattr(kb, "archive_task", move_before_archive)
+    reports = {report.slug: report for report in collect_kanban_status_data(now=now)}
+
+    assert reports["race"].counts["running"] == 1
+    with kb.connect_closing(board="race") as conn:
+        stored = {task.id: task for task in kb.list_tasks(conn, include_archived=True)}
+        assert stored[task_id].status == "running"
+        assert all(event.kind != "archived" for event in kb.list_events(conn, task_id))
+
+
 def test_kanban_status_report_ignores_inherited_env_board_pins(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
 
     from hermes_cli import kanban_db as kb
-    from gateway.kanban_status import collect_kanban_status_data, render_kanban_status_report
+    from gateway.kanban_status import (
+        collect_kanban_status_data,
+        render_kanban_status_report,
+    )
 
     kb.create_board("alpha", name="Alpha Board")
     kb.create_board("beta", name="Beta Board")
@@ -132,12 +494,12 @@ def test_kanban_status_report_ignores_inherited_env_board_pins(monkeypatch, tmp_
     reports = {report.slug: report for report in collect_kanban_status_data()}
     rendered = render_kanban_status_report(max_chars=20_000)
 
-    assert [getattr(task, "title", "") for task in reports["alpha"].sections["blocked"]] == [
-        "Alpha pinned-env task"
-    ]
-    assert [getattr(task, "title", "") for task in reports["beta"].sections["blocked"]] == [
-        "Beta real board task"
-    ]
+    assert [
+        getattr(task, "title", "") for task in reports["alpha"].sections["blocked"]
+    ] == ["Alpha pinned-env task"]
+    assert [
+        getattr(task, "title", "") for task in reports["beta"].sections["blocked"]
+    ] == ["Beta real board task"]
     beta_section = rendered.split("## 📁 Beta Board (beta)", 1)[1]
     assert "Beta real board task" in beta_section
     assert "beta-only blocked note" in beta_section
@@ -176,7 +538,9 @@ def _make_status_runner():
     runner.config = {}
     runner.adapters = {}
     runner.hooks = SimpleNamespace(emit_collect=lambda *_args, **_kwargs: [])
-    runner.session_store = SimpleNamespace(get_or_create_session=lambda *_args, **_kwargs: None)
+    runner.session_store = SimpleNamespace(
+        get_or_create_session=lambda *_args, **_kwargs: None
+    )
     runner.pairing_store = SimpleNamespace()
     runner._update_prompt_pending = {}
     runner._running_agents = {}
@@ -217,7 +581,9 @@ async def test_kanban_status_routes_from_telegram(monkeypatch, tmp_path):
 
     kb.create_board("telegram-board", name="Telegram Board")
     with kb.connect_closing(board="telegram-board") as conn:
-        kb.create_task(conn, title="Telegram status task", assignee="coder", board="telegram-board")
+        kb.create_task(
+            conn, title="Telegram status task", assignee="coder", board="telegram-board"
+        )
 
     runner = _make_status_runner()
     result = await runner._handle_message(_status_event("/kanban_status"))
@@ -237,10 +603,14 @@ async def test_kanban_status_routes_from_slack(monkeypatch, tmp_path):
 
     kb.create_board("slack-board", name="Slack Board")
     with kb.connect_closing(board="slack-board") as conn:
-        kb.create_task(conn, title="Slack status task", assignee="reviewer", board="slack-board")
+        kb.create_task(
+            conn, title="Slack status task", assignee="reviewer", board="slack-board"
+        )
 
     runner = _make_status_runner()
-    result = await runner._handle_message(_status_event("/kanban_status", platform=Platform.SLACK))
+    result = await runner._handle_message(
+        _status_event("/kanban_status", platform=Platform.SLACK)
+    )
 
     assert "Slack Board (slack-board)" in result
     assert "Slack status task" in result
