@@ -908,6 +908,62 @@ async def test_denied_telegram_status_uses_normal_slash_gate_without_collecting(
     ) is False
 
 
+@pytest.mark.parametrize(
+    ("plugin_result", "expected"),
+    [
+        ({"action": "skip", "reason": "plugin-owned"}, None),
+        ({"action": "rewrite", "text": "/kanban_status full"}, "rewritten"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_plugin_dispatch_intercepts_before_native_kanban_pager(
+    monkeypatch, plugin_result, expected
+):
+    from unittest.mock import AsyncMock
+
+    from gateway import kanban_status
+    from gateway.config import Platform
+    from hermes_cli import lifecycle
+
+    native_calls = []
+
+    def unexpected_collection(**_kwargs):
+        native_calls.append("collect")
+        return [_pager_report("secret", "Secret")]
+
+    async def unexpected_delivery(*_args, **_kwargs):
+        native_calls.append("deliver")
+        return True
+
+    monkeypatch.setattr(
+        lifecycle,
+        "invoke_hook",
+        lambda name, **_kwargs: [plugin_result]
+        if name == "pre_gateway_dispatch"
+        else [],
+    )
+    monkeypatch.setattr(
+        kanban_status, "collect_kanban_status_data", unexpected_collection
+    )
+    monkeypatch.setattr(kanban_status, "_deliver_native_pager", unexpected_delivery)
+    monkeypatch.setattr(
+        kanban_status, "_ensure_telegram_callbacks", lambda *_args: True
+    )
+    runner = _make_status_runner()
+    runner.adapters = {Platform.TELEGRAM: SimpleNamespace(_bot=object())}
+    runner._handle_kanban_status_command = AsyncMock(return_value="rewritten")
+
+    result = await runner._handle_message(_status_event("/kanban_status"))
+
+    assert result == expected
+    assert native_calls == []
+    if plugin_result["action"] == "rewrite":
+        rewritten_event = runner._handle_kanban_status_command.await_args.args[0]
+        assert rewritten_event.text == "/kanban_status full"
+    else:
+        runner._handle_kanban_status_command.assert_not_awaited()
+
+
 def test_general_topic_callback_source_uses_adapter_effective_thread_id():
     from dataclasses import replace
 
@@ -926,6 +982,59 @@ def test_general_topic_callback_source_uses_adapter_effective_thread_id():
 
     assert callback_thread == "1"
     assert _owner_key(None, callback_source) == _owner_key(None, initial_source)
+
+
+@pytest.mark.asyncio
+async def test_full_capacity_callback_preserves_valid_sessions_until_creation(
+    monkeypatch,
+):
+    from collections import OrderedDict
+    import time
+
+    from gateway import kanban_status
+
+    now = time.monotonic()
+    sessions = OrderedDict(
+        (
+            f"token-{index}",
+            kanban_status.PagerSession(
+                owner_key="owner",
+                slugs=("alpha",),
+                page=0,
+                created_at=now,
+            ),
+        )
+        for index in range(kanban_status._MAX_PAGER_SESSIONS)
+    )
+    monkeypatch.setattr(kanban_status, "_PAGER_SESSIONS", sessions)
+    reports = [_pager_report("alpha", "Alpha")]
+    monkeypatch.setattr(
+        kanban_status,
+        "collect_kanban_status_data",
+        lambda **_kwargs: reports,
+    )
+
+    callback_result = await kanban_status._handle_pager_action(
+        token="token-0", action="r", owner_key="owner"
+    )
+
+    assert callback_result is not None
+    assert len(sessions) == kanban_status._MAX_PAGER_SESSIONS
+    assert set(sessions) == {
+        f"token-{index}" for index in range(kanban_status._MAX_PAGER_SESSIONS)
+    }
+
+    token = kanban_status._create_pager_session(
+        SimpleNamespace(),
+        _status_event("/kanban_status").source,
+        reports,
+        0,
+    )
+
+    assert len(sessions) == kanban_status._MAX_PAGER_SESSIONS
+    assert "token-0" in sessions
+    assert "token-1" not in sessions
+    assert token in sessions
 
 
 def test_gateway_status_build_is_read_only_even_for_expired_done(monkeypatch, tmp_path):

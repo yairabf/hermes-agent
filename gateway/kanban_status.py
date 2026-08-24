@@ -553,12 +553,12 @@ def _prune_pager_sessions() -> None:
     for token, state in list(_PAGER_SESSIONS.items()):
         if state.created_at < cutoff:
             _PAGER_SESSIONS.pop(token, None)
-    while len(_PAGER_SESSIONS) >= _MAX_PAGER_SESSIONS:
-        _PAGER_SESSIONS.popitem(last=False)
 
 
 def _create_pager_session(gateway: object, source: object, reports: list[BoardReport], page: int) -> str:
     _prune_pager_sessions()
+    while len(_PAGER_SESSIONS) >= _MAX_PAGER_SESSIONS:
+        _PAGER_SESSIONS.popitem(last=False)
     token = secrets.token_urlsafe(9)
     page = min(max(page, 0), max(0, len(reports) - 1))
     _PAGER_SESSIONS[token] = PagerSession(

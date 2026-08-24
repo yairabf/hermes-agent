@@ -15485,23 +15485,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _builtin_exc:
                 logger.warning("built-in /newtask pre-dispatch failed: %s", _builtin_exc, exc_info=True)
                 _hook_results = []
-            if not any(
-                result.get("action") in {"skip", "rewrite"}
-                for result in _hook_results
-                if isinstance(result, dict)
-            ):
-                try:
-                    from gateway.kanban_status import handle_pre_gateway_dispatch as _status_dispatch
-
-                    _status_result = await _status_dispatch(event=event, gateway=self)
-                    if isinstance(_status_result, dict):
-                        _hook_results.append(_status_result)
-                except Exception as _status_exc:
-                    logger.warning(
-                        "built-in /kanban_status pre-dispatch failed: %s",
-                        _status_exc,
-                        exc_info=True,
-                    )
             try:
                 from hermes_cli.lifecycle import invoke_hook as _invoke_hook
                 _hook_results.extend(_invoke_hook(
@@ -15536,6 +15519,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
                 if _action == "allow":
                     break
+
+            # The native pager may deliver Kanban data directly, so plugin
+            # interception must run first. A plugin skip stops here; a rewrite
+            # is reflected in ``event`` before the built-in inspects it.
+            try:
+                from gateway.kanban_status import handle_pre_gateway_dispatch as _status_dispatch
+
+                _status_result = await _status_dispatch(event=event, gateway=self)
+                if isinstance(_status_result, dict):
+                    _status_action = _status_result.get("action")
+                    if _status_action == "skip":
+                        logger.info(
+                            "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
+                            _status_result.get("reason"),
+                            source.platform.value if source.platform else "unknown",
+                            source.chat_id or "unknown",
+                        )
+                        return None
+                    if _status_action == "rewrite":
+                        _status_text = _status_result.get("text")
+                        if isinstance(_status_text, str):
+                            event = dataclasses.replace(event, text=_status_text)
+                            source = event.source
+            except Exception as _status_exc:
+                logger.warning(
+                    "built-in /kanban_status pre-dispatch failed: %s",
+                    _status_exc,
+                    exc_info=True,
+                )
 
         if is_internal:
             pass
