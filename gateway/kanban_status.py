@@ -431,8 +431,8 @@ def render_kanban_status_report(
 
 
 def active_project_reports(reports: Iterable[BoardReport]) -> list[BoardReport]:
-    """Return stable, display-safe reports for boards that currently have tasks."""
-    active = [report for report in reports if report.task_count > 0]
+    """Return stable reports for active boards and boards with collection errors."""
+    active = [report for report in reports if report.task_count > 0 or report.error]
     return sorted(active, key=lambda report: (report.slug.casefold(), report.name.casefold()))
 
 
@@ -743,9 +743,28 @@ async def _deliver_native_pager(
             "parse_mode": ParseMode.MARKDOWN_V2 if use_markdown else None,
             "reply_markup": keyboard,
         }
-        thread_id = getattr(source, "thread_id", None)
-        if thread_id:
-            kwargs["message_thread_id"] = int(thread_id)
+        metadata: Any = None
+        metadata_fn = getattr(gateway, "_thread_metadata_for_source", None)
+        if callable(metadata_fn):
+            try:
+                metadata = metadata_fn(source)
+            except Exception:
+                metadata = None
+        thread_id_fn = getattr(adapter, "_metadata_thread_id", None)
+        thread_kwargs_fn = getattr(adapter, "_thread_kwargs_for_send", None)
+        thread_id = (
+            thread_id_fn(metadata)
+            if callable(thread_id_fn)
+            else getattr(source, "thread_id", None)
+        )
+        if callable(thread_kwargs_fn):
+            helper_kwargs = thread_kwargs_fn(
+                str(getattr(source, "chat_id")), thread_id, metadata
+            )
+            if isinstance(helper_kwargs, dict):
+                kwargs.update(helper_kwargs)
+        elif thread_id:
+            kwargs["message_thread_id"] = int(str(thread_id))
         await adapter._bot.send_message(**kwargs)
         return True
     return False
@@ -759,16 +778,6 @@ async def handle_pre_gateway_dispatch(
     if parsed is None or parsed[0] == "full":
         return None
     source = getattr(event, "source", None)
-    authorize = getattr(gateway, "_is_user_authorized", None)
-    if source is not None and callable(authorize):
-        try:
-            if not authorize(source):
-                return None
-        except Exception:
-            return None
-    reports = active_project_reports(
-        collect_kanban_status_data(maintain_done_retention=False)
-    )
     adapter = _adapter_for_source(gateway, source) if source is not None else None
     platform = str(
         getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
@@ -781,6 +790,18 @@ async def handle_pre_gateway_dispatch(
     )
     if not native_supported:
         return None
+    authorize = getattr(gateway, "_is_user_authorized", None)
+    if source is not None and callable(authorize):
+        try:
+            if not authorize(source):
+                return None
+        except Exception:
+            return None
+    reports = active_project_reports(
+        await asyncio.to_thread(
+            collect_kanban_status_data, maintain_done_retention=False
+        )
+    )
     delivered = await _deliver_native_pager(gateway, event, reports, parsed[1])
     if delivered:
         return {"action": "skip", "reason": "kanban-status-project-pager"}

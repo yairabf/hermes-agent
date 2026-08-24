@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+import threading
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -674,6 +675,28 @@ def test_project_page_hides_empty_projects_and_handles_empty_and_single_cases():
     assert "No active Kanban projects found" in render_kanban_project_page([])
 
 
+def test_project_page_keeps_board_errors_while_hiding_genuinely_empty_projects():
+    from gateway.kanban_status import BoardReport, active_project_reports
+
+    empty = BoardReport(
+        slug="empty",
+        name="Empty",
+        task_count=0,
+        counts=Counter(),
+        sections={},
+    )
+    unreadable = BoardReport(
+        slug="broken",
+        name="Broken",
+        task_count=0,
+        counts=Counter(),
+        sections={},
+        error="PermissionError: unreadable board",
+    )
+
+    assert active_project_reports([empty, unreadable]) == [unreadable]
+
+
 def test_project_page_escapes_untrusted_board_text_and_enforces_message_limit():
     from gateway.kanban_status import BoardReport, render_kanban_project_page
 
@@ -761,6 +784,62 @@ async def test_kanban_status_pre_dispatch_falls_back_to_numbered_text(monkeypatc
     assert "/kanban_status full" in text
 
 
+@pytest.mark.asyncio
+async def test_non_telegram_pre_dispatch_does_not_collect_kanban_data(monkeypatch):
+    from gateway import kanban_status
+    from gateway.config import Platform
+
+    def unexpected_collection(**_kwargs):
+        raise AssertionError("non-Telegram pre-dispatch must not read Kanban data")
+
+    monkeypatch.setattr(
+        kanban_status, "collect_kanban_status_data", unexpected_collection
+    )
+    gateway = SimpleNamespace(
+        adapters={Platform.SLACK: SimpleNamespace(_app=object())},
+        _is_user_authorized=lambda _source: True,
+    )
+
+    result = await kanban_status.handle_pre_gateway_dispatch(
+        event=_status_event("/kanban_status", platform=Platform.SLACK), gateway=gateway
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_telegram_pre_dispatch_collects_kanban_data_off_event_loop(monkeypatch):
+    from gateway import kanban_status
+    from gateway.config import Platform
+
+    event_loop_thread = threading.get_ident()
+    collection_threads = []
+    reports = [_pager_report("alpha", "Alpha")]
+
+    def collect(**_kwargs):
+        collection_threads.append(threading.get_ident())
+        return reports
+
+    async def deliver(_gateway, _event, delivered_reports, _page):
+        assert delivered_reports == reports
+        return True
+
+    monkeypatch.setattr(kanban_status, "collect_kanban_status_data", collect)
+    monkeypatch.setattr(kanban_status, "_deliver_native_pager", deliver)
+    gateway = SimpleNamespace(
+        adapters={Platform.TELEGRAM: SimpleNamespace(_bot=object())},
+        _is_user_authorized=lambda _source: True,
+    )
+
+    result = await kanban_status.handle_pre_gateway_dispatch(
+        event=_status_event("/kanban_status"), gateway=gateway
+    )
+
+    assert result == {"action": "skip", "reason": "kanban-status-project-pager"}
+    assert collection_threads
+    assert collection_threads[0] != event_loop_thread
+
+
 def test_gateway_status_build_is_read_only_even_for_expired_done(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
@@ -831,6 +910,55 @@ async def test_telegram_native_pager_sends_valid_buttons_and_single_project_refr
     specs = _pager_button_specs("abcdef", 1)
     assert [label for label, _data in specs] == ["Refresh"]
     assert parse_pager_callback(specs[0][1])[1] == "r"
+
+
+@pytest.mark.asyncio
+async def test_telegram_native_pager_uses_adapter_thread_send_kwargs():
+    from dataclasses import replace
+
+    from gateway.config import Platform
+    from gateway.kanban_status import _deliver_native_pager
+
+    class FakeBot:
+        def __init__(self):
+            self.kwargs = None
+
+        async def send_message(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeApp:
+        def add_handler(self, *_args, **_kwargs):
+            return None
+
+    metadata = {"telegram_message_thread_id": "general"}
+    bot = FakeBot()
+    adapter = SimpleNamespace(
+        _bot=bot,
+        _app=FakeApp(),
+        format_message=lambda text: text,
+        _metadata_thread_id=lambda value: (
+            "general" if value is metadata else pytest.fail("wrong metadata")
+        ),
+        _thread_kwargs_for_send=lambda chat_id, thread_id, value: {
+            "direct_messages_topic_id": 77
+            if (chat_id, thread_id, value) == ("12345", "general", metadata)
+            else pytest.fail("wrong thread helper arguments")
+        },
+    )
+    gateway = SimpleNamespace(
+        adapters={Platform.TELEGRAM: adapter},
+        _thread_metadata_for_source=lambda _source: metadata,
+    )
+    event = _status_event("/kanban_status")
+    event = replace(event, source=replace(event.source, chat_id="12345"))
+
+    delivered = await _deliver_native_pager(
+        gateway, event, [_pager_report("only", "Only")], 0
+    )
+
+    assert delivered is True
+    assert bot.kwargs["direct_messages_topic_id"] == 77
+    assert "message_thread_id" not in bot.kwargs
 
 
 @pytest.mark.asyncio
