@@ -520,6 +520,13 @@ def _owner_key(_gateway: object, source: object) -> str:
 
 
 def _callback_is_authorized(gateway: object, source: object) -> bool:
+    check_slash_access = getattr(gateway, "_check_slash_access", None)
+    if callable(check_slash_access):
+        try:
+            if check_slash_access(source, "kanban_status") is not None:
+                return False
+        except Exception:
+            return False
     authorize = getattr(gateway, "_is_user_authorized", None)
     if not callable(authorize):
         return True
@@ -527,6 +534,18 @@ def _callback_is_authorized(gateway: object, source: object) -> bool:
         return bool(authorize(source))
     except Exception:
         return False
+
+
+def _callback_source_thread_id(adapter: object, message: object) -> str | None:
+    """Normalize callback routing exactly like an inbound Telegram message."""
+    effective_thread_id = getattr(adapter, "_effective_message_thread_id", None)
+    if callable(effective_thread_id):
+        try:
+            normalized = effective_thread_id(message)
+            return str(normalized) if normalized is not None else None
+        except Exception:
+            return None
+    return str(getattr(message, "message_thread_id", "") or "") or None
 
 
 def _prune_pager_sessions() -> None:
@@ -654,7 +673,7 @@ def _ensure_telegram_callbacks(gateway: object, adapter: object) -> bool:
         message = getattr(query, "message", None)
         user = getattr(query, "from_user", None)
         chat = getattr(message, "chat", None)
-        thread_id = str(getattr(message, "message_thread_id", "") or "") or None
+        thread_id = _callback_source_thread_id(adapter, message)
         raw_chat_type = str(getattr(chat, "type", "private") or "private")
         chat_type = "dm" if raw_chat_type == "private" else "group"
         if raw_chat_type == "supergroup" and thread_id:
@@ -790,6 +809,13 @@ async def handle_pre_gateway_dispatch(
     )
     if not native_supported:
         return None
+    check_slash_access = getattr(gateway, "_check_slash_access", None)
+    if source is not None and callable(check_slash_access):
+        try:
+            if check_slash_access(source, "kanban_status") is not None:
+                return None
+        except Exception:
+            return None
     authorize = getattr(gateway, "_is_user_authorized", None)
     if source is not None and callable(authorize):
         try:

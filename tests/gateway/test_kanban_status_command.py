@@ -868,6 +868,66 @@ async def test_telegram_pre_dispatch_collects_kanban_data_off_event_loop(monkeyp
     assert collection_threads[0] != event_loop_thread
 
 
+@pytest.mark.asyncio
+async def test_denied_telegram_status_uses_normal_slash_gate_without_collecting(monkeypatch):
+    from gateway import kanban_status
+    from gateway.config import Platform
+
+    collections = []
+
+    def unexpected_collection(**_kwargs):
+        collections.append(True)
+        return [_pager_report("secret", "Secret")]
+
+    monkeypatch.setattr(
+        kanban_status, "collect_kanban_status_data", unexpected_collection
+    )
+    monkeypatch.setattr(
+        kanban_status, "_ensure_telegram_callbacks", lambda *_args: True
+    )
+
+    class FakeApp:
+        def add_handler(self, *_args, **_kwargs):
+            return None
+
+    runner = _make_status_runner()
+    runner.adapters = {
+        Platform.TELEGRAM: SimpleNamespace(_bot=object(), _app=FakeApp())
+    }
+    denial = "⛔ /kanban_status is admin-only here."
+    runner._check_slash_access = lambda _source, command: (
+        denial if command == "kanban_status" else None
+    )
+
+    result = await runner._handle_message(_status_event("/kanban_status"))
+
+    assert result == denial
+    assert collections == []
+    assert kanban_status._callback_is_authorized(
+        runner, _status_event("/kanban_status").source
+    ) is False
+
+
+def test_general_topic_callback_source_uses_adapter_effective_thread_id():
+    from dataclasses import replace
+
+    from gateway.kanban_status import _callback_source_thread_id, _owner_key
+
+    message = SimpleNamespace(message_thread_id=None)
+    adapter = SimpleNamespace(
+        _effective_message_thread_id=lambda value: (
+            "1" if value is message else pytest.fail("wrong callback message")
+        )
+    )
+
+    callback_thread = _callback_source_thread_id(adapter, message)
+    initial_source = replace(_status_event("/kanban_status").source, thread_id="1")
+    callback_source = replace(initial_source, thread_id=callback_thread)
+
+    assert callback_thread == "1"
+    assert _owner_key(None, callback_source) == _owner_key(None, initial_source)
+
+
 def test_gateway_status_build_is_read_only_even_for_expired_done(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
