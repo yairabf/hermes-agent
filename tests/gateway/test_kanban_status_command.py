@@ -808,6 +808,31 @@ async def test_non_telegram_pre_dispatch_does_not_collect_kanban_data(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_telegram_without_callback_support_does_not_collect_kanban_data(
+    monkeypatch,
+):
+    from gateway import kanban_status
+    from gateway.config import Platform
+
+    def unexpected_collection(**_kwargs):
+        raise AssertionError("non-native Telegram fallback must not read Kanban data")
+
+    monkeypatch.setattr(
+        kanban_status, "collect_kanban_status_data", unexpected_collection
+    )
+    gateway = SimpleNamespace(
+        adapters={Platform.TELEGRAM: SimpleNamespace(_bot=object(), _app=None)},
+        _is_user_authorized=lambda _source: True,
+    )
+
+    result = await kanban_status.handle_pre_gateway_dispatch(
+        event=_status_event("/kanban_status"), gateway=gateway
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_telegram_pre_dispatch_collects_kanban_data_off_event_loop(monkeypatch):
     from gateway import kanban_status
     from gateway.config import Platform
@@ -826,6 +851,9 @@ async def test_telegram_pre_dispatch_collects_kanban_data_off_event_loop(monkeyp
 
     monkeypatch.setattr(kanban_status, "collect_kanban_status_data", collect)
     monkeypatch.setattr(kanban_status, "_deliver_native_pager", deliver)
+    monkeypatch.setattr(
+        kanban_status, "_ensure_telegram_callbacks", lambda *_args: True
+    )
     gateway = SimpleNamespace(
         adapters={Platform.TELEGRAM: SimpleNamespace(_bot=object())},
         _is_user_authorized=lambda _source: True,

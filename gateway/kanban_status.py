@@ -797,6 +797,8 @@ async def handle_pre_gateway_dispatch(
                 return None
         except Exception:
             return None
+    if not _ensure_telegram_callbacks(gateway, adapter):
+        return None
     reports = active_project_reports(
         await asyncio.to_thread(
             collect_kanban_status_data, maintain_done_retention=False
