@@ -17,6 +17,7 @@ def test_kanban_status_command_is_gateway_registered():
     assert cmd is not None
     assert cmd.name == "kanban_status"
     assert cmd.gateway_only is True
+    assert "project" in cmd.description.casefold()
     assert alias is cmd
     assert is_gateway_known_command("kanban_status") is True
 
@@ -615,3 +616,354 @@ async def test_kanban_status_routes_from_slack(monkeypatch, tmp_path):
     assert "Slack Board (slack-board)" in result
     assert "Slack status task" in result
     assert "👤 assignee: reviewer" in result
+
+
+def _pager_report(slug: str, name: str, *, status: str = "ready"):
+    from gateway.kanban_status import BoardReport
+
+    task = SimpleNamespace(
+        id=f"t_{slug}",
+        title=f"Task for {name}",
+        assignee="coder",
+        priority=0,
+        tenant=None,
+        status=status,
+        created_at=None,
+        started_at=None,
+        completed_at=None,
+    )
+    return BoardReport(
+        slug=slug,
+        name=name,
+        task_count=1,
+        counts=Counter({status: 1}),
+        sections={status: [task]},
+    )
+
+
+def test_project_page_renders_exactly_one_project_and_clamps_bounds():
+    from gateway.kanban_status import render_kanban_project_page
+
+    reports = [_pager_report("alpha", "Alpha"), _pager_report("beta", "Beta")]
+
+    first = render_kanban_project_page(reports, page=-99, max_chars=4_000)
+    last = render_kanban_project_page(reports, page=99, max_chars=4_000)
+
+    assert "Alpha (alpha)" in first
+    assert "Beta (beta)" not in first
+    assert "Project 1 of 2" in first
+    assert "Beta (beta)" in last
+    assert "Alpha (alpha)" not in last
+    assert "Project 2 of 2" in last
+
+
+def test_project_page_hides_empty_projects_and_handles_empty_and_single_cases():
+    from gateway.kanban_status import BoardReport, active_project_reports, render_kanban_project_page
+
+    empty = BoardReport(
+        slug="empty",
+        name="Empty",
+        task_count=0,
+        counts=Counter(),
+        sections={},
+    )
+    single = _pager_report("active", "Active")
+
+    assert active_project_reports([empty, single]) == [single]
+    assert "Project 1 of 1" in render_kanban_project_page([single])
+    assert "No active Kanban projects found" in render_kanban_project_page([])
+
+
+def test_project_page_escapes_untrusted_board_text_and_enforces_message_limit():
+    from gateway.kanban_status import BoardReport, render_kanban_project_page
+
+    unsafe = BoardReport(
+        slug="bad`slug<raw>\x07",
+        name="Bad <board>\n`name`",
+        task_count=1,
+        counts=Counter({"ready": 1}),
+        sections={"ready": [_pager_report("nested", "Nested").sections["ready"][0]]},
+    )
+    rendered = render_kanban_project_page([unsafe], max_chars=500)
+
+    assert "<board>" not in rendered
+    assert "`name`" not in rendered
+    assert "\x07" not in rendered
+    assert len(rendered) <= 500
+
+
+def test_project_page_extracts_review_qa_and_deploy_gate_cues():
+    from gateway.kanban_status import _extract_task_cues
+
+    task = SimpleNamespace(
+        status="review",
+        result="Implementation complete; PR #42 is awaiting exact-head review.",
+        body="QA must pass before deploy.",
+        last_failure_error=None,
+    )
+    comments = [
+        SimpleNamespace(body="stage:qa — QA passed; coordinator deploy gate remains")
+    ]
+
+    cues = _extract_task_cues(task, comments)
+
+    assert any("PR #42" in cue for cue in cues)
+    assert any("QA passed" in cue and "deploy gate" in cue for cue in cues)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ("kstatus:Abc123_-:n", ("Abc123_-", "n")),
+        ("kstatus:token_1:p", ("token_1", "p")),
+        ("kstatus:token-2:r", ("token-2", "r")),
+        ("kstatus:token-2:x", None),
+        ("kstatus:../../etc:n", None),
+        ("kstatus:token:n:extra", None),
+        ("other:token:n", None),
+    ],
+)
+def test_project_pager_callback_payload_validation(payload, expected):
+    from gateway.kanban_status import parse_pager_callback
+
+    assert parse_pager_callback(payload) == expected
+
+
+def test_kanban_status_full_preserves_all_project_dump(monkeypatch):
+    from gateway import kanban_status
+
+    reports = [_pager_report("alpha", "Alpha"), _pager_report("beta", "Beta")]
+    monkeypatch.setattr(kanban_status, "collect_kanban_status_data", lambda **_kwargs: reports)
+
+    full = kanban_status.build_kanban_status_report(mode="full")
+    page = kanban_status.build_kanban_status_report(mode="page", page=0)
+
+    assert "Alpha (alpha)" in full and "Beta (beta)" in full
+    assert "Alpha (alpha)" in page and "Beta (beta)" not in page
+
+
+@pytest.mark.asyncio
+async def test_kanban_status_pre_dispatch_falls_back_to_numbered_text(monkeypatch):
+    from gateway import kanban_status
+
+    reports = [_pager_report("alpha", "Alpha"), _pager_report("beta", "Beta")]
+    monkeypatch.setattr(kanban_status, "collect_kanban_status_data", lambda **_kwargs: reports)
+    gateway = SimpleNamespace(adapters={}, _is_user_authorized=lambda _source: True)
+
+    result = await kanban_status.handle_pre_gateway_dispatch(
+        event=_status_event("/kanban_status 2"), gateway=gateway
+    )
+    text = kanban_status.build_kanban_status_report(mode="page", page=1)
+
+    assert result is None
+    assert "Beta (beta)" in text
+    assert "/kanban_status 1" in text
+    assert "/kanban_status full" in text
+
+
+def test_gateway_status_build_is_read_only_even_for_expired_done(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    from gateway.kanban_status import build_kanban_status_report
+    from hermes_cli import kanban_db as kb
+
+    kb.create_board("read-only", name="Read Only")
+    with kb.connect_closing(board="read-only") as conn:
+        task_id = kb.create_task(
+            conn, title="Old Done", assignee="coder", board="read-only"
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+            ((datetime.now(timezone.utc) - timedelta(days=90)).timestamp(), task_id),
+        )
+
+    rendered = build_kanban_status_report()
+
+    assert "Old Done" in rendered
+    with kb.connect_closing(board="read-only") as conn:
+        stored = {task.id: task for task in kb.list_tasks(conn, include_archived=True)}
+    assert stored[task_id].status == "done"
+
+
+@pytest.mark.asyncio
+async def test_telegram_native_pager_sends_valid_buttons_and_single_project_refresh_only():
+    from dataclasses import replace
+
+    from gateway.config import Platform
+    from gateway.kanban_status import (
+        _deliver_native_pager,
+        _pager_button_specs,
+        parse_pager_callback,
+    )
+
+    class FakeBot:
+        def __init__(self):
+            self.kwargs = None
+
+        async def send_message(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeApp:
+        def add_handler(self, *_args, **_kwargs):
+            return None
+
+    bot = FakeBot()
+    adapter = SimpleNamespace(
+        _bot=bot,
+        _app=FakeApp(),
+        format_message=lambda text: text,
+    )
+    gateway = SimpleNamespace(
+        adapters={Platform.TELEGRAM: adapter},
+        _session_key_for_source=lambda _source: "telegram:chat:user",
+    )
+
+    event = _status_event("/kanban_status")
+    event = replace(event, source=replace(event.source, chat_id="12345"))
+    delivered = await _deliver_native_pager(
+        gateway, event, [_pager_report("only", "Only")], 0
+    )
+
+    assert delivered is True
+    assert bot.kwargs["reply_markup"] is not None
+    specs = _pager_button_specs("abcdef", 1)
+    assert [label for label, _data in specs] == ["Refresh"]
+    assert parse_pager_callback(specs[0][1])[1] == "r"
+
+
+@pytest.mark.asyncio
+async def test_pager_action_enforces_owner_bounds_and_refreshes_live_data(monkeypatch):
+    from gateway import kanban_status
+
+    source = _status_event("/kanban_status").source
+    gateway = SimpleNamespace(_session_key_for_source=lambda _source: "owner")
+    reports = [_pager_report("alpha", "Alpha"), _pager_report("beta", "Beta")]
+    token = kanban_status._create_pager_session(gateway, source, reports, 0)
+    refreshed = [_pager_report("alpha", "Alpha Live"), _pager_report("beta", "Beta Live")]
+    monkeypatch.setattr(
+        kanban_status,
+        "collect_kanban_status_data",
+        lambda **_kwargs: refreshed,
+    )
+
+    assert (
+        await kanban_status._handle_pager_action(
+            token=token, action="n", owner_key="someone-else"
+        )
+        is None
+    )
+    owner = kanban_status._owner_key(gateway, source)
+    state, live, text = await kanban_status._handle_pager_action(
+        token=token, action="n", owner_key=owner
+    )
+    assert state.page == 1
+    assert [report.slug for report in live] == ["alpha", "beta"]
+    assert "Beta Live (beta)" in text
+
+    state, _live, _text = await kanban_status._handle_pager_action(
+        token=token, action="n", owner_key=owner
+    )
+    assert state.page == 1
+
+
+@pytest.mark.asyncio
+async def test_native_pager_falls_back_when_callback_registration_fails():
+    from dataclasses import replace
+
+    from gateway.config import Platform
+    from gateway.kanban_status import _deliver_native_pager
+
+    class BrokenApp:
+        def add_handler(self, *_args, **_kwargs):
+            raise RuntimeError("cannot register")
+
+    class FakeBot:
+        async def send_message(self, **_kwargs):
+            raise AssertionError("message must not be sent with dead buttons")
+
+    adapter = SimpleNamespace(
+        _bot=FakeBot(),
+        _app=BrokenApp(),
+        format_message=lambda text: text,
+    )
+    gateway = SimpleNamespace(adapters={Platform.TELEGRAM: adapter})
+    event = _status_event("/kanban_status")
+    event = replace(event, source=replace(event.source, chat_id="12345"))
+
+    delivered = await _deliver_native_pager(
+        gateway, event, [_pager_report("only", "Only")], 0
+    )
+
+    assert delivered is False
+
+
+@pytest.mark.asyncio
+async def test_slack_degrades_to_numbered_text_fallback(monkeypatch):
+    from gateway import kanban_status
+    from gateway.config import Platform
+
+    reports = [_pager_report("alpha", "Alpha"), _pager_report("beta", "Beta")]
+    monkeypatch.setattr(
+        kanban_status, "collect_kanban_status_data", lambda **_kwargs: reports
+    )
+    gateway = SimpleNamespace(
+        adapters={Platform.SLACK: SimpleNamespace(_app=object())},
+        _is_user_authorized=lambda _source: True,
+    )
+
+    result = await kanban_status.handle_pre_gateway_dispatch(
+        event=_status_event("/kanban_status", platform=Platform.SLACK), gateway=gateway
+    )
+    text = kanban_status.build_kanban_status_report(mode="page", page=0)
+
+    assert result is None
+    assert "Alpha (alpha)" in text
+    assert "/kanban_status 2" in text
+
+
+def test_pager_owner_identity_includes_scope_thread_and_user():
+    from gateway.config import Platform
+    from gateway.kanban_status import _owner_key
+    from gateway.session import SessionSource
+
+    base = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C1",
+        chat_type="group",
+        user_id="U1",
+        thread_id="T1",
+        scope_id="W1",
+    )
+
+    assert _owner_key(None, base) == _owner_key(None, base)
+    assert _owner_key(None, base) != _owner_key(
+        None, SimpleNamespace(**{**base.__dict__, "user_id": "U2"})
+    )
+    assert _owner_key(None, base) != _owner_key(
+        None, SimpleNamespace(**{**base.__dict__, "thread_id": "T2"})
+    )
+    assert _owner_key(None, base) != _owner_key(
+        None, SimpleNamespace(**{**base.__dict__, "scope_id": "W2"})
+    )
+    assert _owner_key(None, base) != _owner_key(
+        None, SimpleNamespace(**{**base.__dict__, "profile": "other"})
+    )
+
+
+def test_telegram_payload_enforces_limit_after_markdown_expansion():
+    from gateway.kanban_status import _telegram_payload
+    from gateway.platforms.base import utf16_len
+
+    adapter = SimpleNamespace(format_message=lambda text: text.replace("a", "\\a"))
+
+    payload, use_markdown = _telegram_payload(adapter, "a" * 3_800)
+    astral_payload, astral_markdown = _telegram_payload(
+        SimpleNamespace(format_message=lambda text: text), "😀" * 3_000
+    )
+
+    assert utf16_len(payload) <= 4_096
+    assert use_markdown is False
+    assert utf16_len(astral_payload) <= 4_096
+    assert astral_markdown is False

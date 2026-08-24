@@ -15485,6 +15485,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _builtin_exc:
                 logger.warning("built-in /newtask pre-dispatch failed: %s", _builtin_exc, exc_info=True)
                 _hook_results = []
+            if not any(
+                result.get("action") in {"skip", "rewrite"}
+                for result in _hook_results
+                if isinstance(result, dict)
+            ):
+                try:
+                    from gateway.kanban_status import handle_pre_gateway_dispatch as _status_dispatch
+
+                    _status_result = await _status_dispatch(event=event, gateway=self)
+                    if isinstance(_status_result, dict):
+                        _hook_results.append(_status_result)
+                except Exception as _status_exc:
+                    logger.warning(
+                        "built-in /kanban_status pre-dispatch failed: %s",
+                        _status_exc,
+                        exc_info=True,
+                    )
             try:
                 from hermes_cli.lifecycle import invoke_hook as _invoke_hook
                 _hook_results.extend(_invoke_hook(
