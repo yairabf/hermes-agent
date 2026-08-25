@@ -7,6 +7,7 @@ import math
 import re
 import secrets
 import time
+import weakref
 from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
@@ -53,6 +54,7 @@ _KANBAN_STATUS_COMMAND_RE = re.compile(
 )
 _PAGER_SESSION_TTL = 30 * 60
 _MAX_PAGER_SESSIONS = 128
+_TELEGRAM_CALLBACK_APPS: weakref.WeakSet[object] = weakref.WeakSet()
 
 
 @dataclass(frozen=True)
@@ -653,11 +655,15 @@ async def _handle_pager_action(
 
 
 def _ensure_telegram_callbacks(gateway: object, adapter: object) -> bool:
-    if getattr(adapter, "_kanban_status_callbacks", False):
-        return True
     app = getattr(adapter, "_app", None)
     if app is None:
         return False
+    try:
+        if app in _TELEGRAM_CALLBACK_APPS:
+            return True
+    except TypeError:
+        if getattr(adapter, "_kanban_status_callbacks_app", None) is app:
+            return True
     try:
         from gateway.config import Platform
         from gateway.session import SessionSource
@@ -723,6 +729,11 @@ def _ensure_telegram_callbacks(gateway: object, adapter: object) -> bool:
     try:
         app.add_handler(CallbackQueryHandler(_callback, pattern=r"^kstatus:"), group=-1)
         setattr(adapter, "_kanban_status_callbacks", True)
+        setattr(adapter, "_kanban_status_callbacks_app", app)
+        try:
+            _TELEGRAM_CALLBACK_APPS.add(app)
+        except TypeError:
+            pass
         return True
     except Exception:
         return False

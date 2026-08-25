@@ -16851,35 +16851,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "allow":
                     break
 
-            # The native pager may deliver Kanban data directly, so plugin
-            # interception must run first. A plugin skip stops here; a rewrite
-            # is reflected in ``event`` before the built-in inspects it.
-            try:
-                from gateway.kanban_status import handle_pre_gateway_dispatch as _status_dispatch
-
-                _status_result = await _status_dispatch(event=event, gateway=self)
-                if isinstance(_status_result, dict):
-                    _status_action = _status_result.get("action")
-                    if _status_action == "skip":
-                        logger.info(
-                            "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                            _status_result.get("reason"),
-                            source.platform.value if source.platform else "unknown",
-                            source.chat_id or "unknown",
-                        )
-                        return None
-                    if _status_action == "rewrite":
-                        _status_text = _status_result.get("text")
-                        if isinstance(_status_text, str):
-                            event = dataclasses.replace(event, text=_status_text)
-                            source = event.source
-            except Exception as _status_exc:
-                logger.warning(
-                    "built-in /kanban_status pre-dispatch failed: %s",
-                    _status_exc,
-                    exc_info=True,
-                )
-
         if is_internal:
             pass
         elif source.user_id is None:
@@ -17631,6 +17602,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _cmd_def = _resolve_cmd(command) if command else None
                     canonical = _cmd_def.name if _cmd_def else command
                     break
+
+        # Native /kanban_status delivery contains live Kanban data. Run it only
+        # after the standard command middleware has had the same opportunity to
+        # deny, handle, or rewrite the command as every other gateway command.
+        # The earlier pre_gateway_dispatch hook still runs first, so its skip or
+        # rewrite decisions are also reflected here without firing either hook
+        # twice.
+        if not is_internal and canonical == "kanban_status":
+            try:
+                from gateway.kanban_status import (
+                    handle_pre_gateway_dispatch as _status_dispatch,
+                )
+
+                _status_result = await _status_dispatch(event=event, gateway=self)
+                if isinstance(_status_result, dict):
+                    _status_action = _status_result.get("action")
+                    if _status_action == "skip":
+                        logger.info(
+                            "native /kanban_status handled: reason=%s platform=%s chat=%s",
+                            _status_result.get("reason"),
+                            source.platform.value if source.platform else "unknown",
+                            source.chat_id or "unknown",
+                        )
+                        return None
+                    if _status_action == "rewrite":
+                        _status_text = _status_result.get("text")
+                        if isinstance(_status_text, str):
+                            event = dataclasses.replace(event, text=_status_text)
+                            source = event.source
+            except Exception as _status_exc:
+                logger.warning(
+                    "built-in /kanban_status native dispatch failed: %s",
+                    _status_exc,
+                    exc_info=True,
+                )
 
         if canonical == "pause":
             return await self._handle_pause_command(event)

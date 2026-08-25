@@ -1039,6 +1039,64 @@ async def test_plugin_dispatch_intercepts_before_native_kanban_pager(
         runner._handle_kanban_status_command.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("hook_result", "expected"),
+    [
+        ({"decision": "deny", "message": "blocked by middleware"}, "blocked by middleware"),
+        ({"decision": "handled", "message": "handled by middleware"}, "handled by middleware"),
+        (
+            {
+                "decision": "rewrite",
+                "command_name": "kanban_status",
+                "raw_args": "full",
+            },
+            "rewritten full report",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_command_middleware_intercepts_before_native_kanban_pager(
+    monkeypatch, hook_result, expected
+):
+    from unittest.mock import AsyncMock
+
+    from gateway import kanban_status
+    from gateway.config import Platform
+
+    native_calls = []
+
+    def unexpected_collection(**_kwargs):
+        native_calls.append("collect")
+        raise AssertionError("middleware must run before native Kanban collection")
+
+    async def unexpected_delivery(*_args, **_kwargs):
+        native_calls.append("deliver")
+        raise AssertionError("middleware must run before native pager delivery")
+
+    runner = _make_status_runner()
+    runner.adapters = {Platform.TELEGRAM: SimpleNamespace(_bot=object(), _app=object())}
+    runner.hooks = SimpleNamespace(emit_collect=AsyncMock(return_value=[hook_result]))
+    runner._handle_kanban_status_command = AsyncMock(return_value="rewritten full report")
+    monkeypatch.setattr(
+        kanban_status, "collect_kanban_status_data", unexpected_collection
+    )
+    monkeypatch.setattr(kanban_status, "_deliver_native_pager", unexpected_delivery)
+    monkeypatch.setattr(
+        kanban_status, "_ensure_telegram_callbacks", lambda *_args: True
+    )
+
+    result = await runner._handle_message(_status_event("/kanban_status"))
+
+    assert result == expected
+    assert native_calls == []
+    runner.hooks.emit_collect.assert_awaited_once()
+    if hook_result["decision"] == "rewrite":
+        rewritten_event = runner._handle_kanban_status_command.await_args.args[0]
+        assert rewritten_event.text == "/kanban_status full"
+    else:
+        runner._handle_kanban_status_command.assert_not_awaited()
+
+
 def test_general_topic_callback_source_uses_adapter_effective_thread_id():
     from dataclasses import replace
 
@@ -1182,6 +1240,38 @@ async def test_telegram_native_pager_sends_valid_buttons_and_single_project_refr
     specs = _pager_button_specs("abcdef", 1)
     assert [label for label, _data in specs] == ["Refresh"]
     assert parse_pager_callback(specs[0][1])[1] == "r"
+
+
+def test_telegram_callback_registration_follows_rebuilt_application():
+    from gateway.kanban_status import _ensure_telegram_callbacks
+
+    class FakeApp:
+        def __init__(self):
+            self.handlers = []
+
+        def add_handler(self, handler, **kwargs):
+            self.handlers.append((handler, kwargs))
+
+    first_app = FakeApp()
+    adapter = SimpleNamespace(_app=first_app)
+
+    assert _ensure_telegram_callbacks(SimpleNamespace(), adapter) is True
+    assert len(first_app.handlers) == 1
+    assert _ensure_telegram_callbacks(SimpleNamespace(), adapter) is True
+    assert len(first_app.handlers) == 1
+
+    replacement_app = FakeApp()
+    adapter._app = replacement_app
+
+    assert _ensure_telegram_callbacks(SimpleNamespace(), adapter) is True
+    assert len(first_app.handlers) == 1
+    assert len(replacement_app.handlers) == 1
+
+    adapter._app = first_app
+
+    assert _ensure_telegram_callbacks(SimpleNamespace(), adapter) is True
+    assert len(first_app.handlers) == 1
+    assert len(replacement_app.handlers) == 1
 
 
 @pytest.mark.asyncio
