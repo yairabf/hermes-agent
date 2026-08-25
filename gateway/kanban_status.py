@@ -646,7 +646,10 @@ async def _handle_pager_action(
     state.created_at = time.monotonic()
     _PAGER_SESSIONS.move_to_end(token)
     reports = await asyncio.to_thread(_reports_for_session, state)
-    return state, reports, render_kanban_project_page(reports, page=state.page)
+    text = await asyncio.to_thread(
+        render_kanban_project_page, reports, page=state.page
+    )
+    return state, reports, text
 
 
 def _ensure_telegram_callbacks(gateway: object, adapter: object) -> bool:
@@ -744,7 +747,9 @@ async def _deliver_native_pager(
         return False
     token = _create_pager_session(gateway, source, reports, page)
     state = _PAGER_SESSIONS[token]
-    text = render_kanban_project_page(reports, page=state.page)
+    text = await asyncio.to_thread(
+        render_kanban_project_page, reports, page=state.page
+    )
     specs = _pager_button_specs(token, len(reports))
     if platform == "telegram" and getattr(adapter, "_bot", None) is not None:
         try:

@@ -868,6 +868,81 @@ async def test_telegram_pre_dispatch_collects_kanban_data_off_event_loop(monkeyp
     assert collection_threads[0] != event_loop_thread
 
 
+@pytest.mark.parametrize("path", ["initial", "callback"])
+@pytest.mark.asyncio
+async def test_native_pager_comment_render_runs_off_event_loop(
+    monkeypatch, tmp_path, path
+):
+    from collections import OrderedDict
+    from dataclasses import replace
+
+    from gateway import kanban_status
+    from gateway.config import Platform
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setattr(kanban_status, "_PAGER_SESSIONS", OrderedDict())
+
+    kb.create_board("render-thread", name="Render Thread")
+    with kb.connect_closing(board="render-thread") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Needs comment cues",
+            assignee="reviewer",
+            initial_status="blocked",
+            board="render-thread",
+        )
+        kb.add_comment(conn, task_id, "reviewer", "blocked: waiting for approval")
+
+    event_loop_thread = threading.get_ident()
+    comment_read_threads = []
+    real_list_comments = kb.list_comments
+
+    def tracked_list_comments(conn, current_task_id):
+        comment_read_threads.append(threading.get_ident())
+        return real_list_comments(conn, current_task_id)
+
+    monkeypatch.setattr(kb, "list_comments", tracked_list_comments)
+    reports = kanban_status.active_project_reports(
+        kanban_status.collect_kanban_status_data(maintain_done_retention=False)
+    )
+    event = _status_event("/kanban_status")
+    event = replace(event, source=replace(event.source, chat_id="12345"))
+
+    if path == "initial":
+        class FakeBot:
+            async def send_message(self, **_kwargs):
+                return None
+
+        class FakeApp:
+            def add_handler(self, *_args, **_kwargs):
+                return None
+
+        adapter = SimpleNamespace(
+            _bot=FakeBot(),
+            _app=FakeApp(),
+            format_message=lambda text: text,
+        )
+        gateway = SimpleNamespace(adapters={Platform.TELEGRAM: adapter})
+        assert await kanban_status._deliver_native_pager(gateway, event, reports, 0)
+    else:
+        gateway = SimpleNamespace()
+        token = kanban_status._create_pager_session(
+            gateway, event.source, reports, 0
+        )
+        result = await kanban_status._handle_pager_action(
+            token=token,
+            action="r",
+            owner_key=kanban_status._owner_key(gateway, event.source),
+        )
+        assert result is not None
+
+    assert comment_read_threads
+    assert all(thread_id != event_loop_thread for thread_id in comment_read_threads)
+
+
 @pytest.mark.asyncio
 async def test_denied_telegram_status_uses_normal_slash_gate_without_collecting(monkeypatch):
     from gateway import kanban_status
