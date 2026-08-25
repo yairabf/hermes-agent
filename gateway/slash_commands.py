@@ -573,6 +573,28 @@ class GatewaySlashCommandsMixin:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
 
+    async def _handle_kanban_status_command(self, event: MessageEvent) -> str:
+        """Handle /kanban_status — live report across active Kanban boards."""
+        import asyncio
+        from gateway.kanban_status import _parse_command, build_kanban_status_report
+
+        try:
+            mode, page = _parse_command(getattr(event, "text", "")) or ("page", 0)
+            output = await asyncio.to_thread(
+                build_kanban_status_report, mode=mode, page=page
+            )
+        except Exception as exc:  # pragma: no cover - defensive gateway guard
+            logger.warning("/kanban_status failed: %s", exc, exc_info=True)
+            return f"⚠️ Could not build Kanban status report: {exc}"
+        return output or "No Kanban status data available."
+
+    async def _handle_newtask_command(self, event: MessageEvent) -> str:
+        """Handle /newtask fallback if the pre-dispatch picker cannot deliver native UI."""
+        from gateway.newtask import handle_command, parse_newtask_command
+
+        raw_args = parse_newtask_command(getattr(event, "text", "")) or ""
+        return handle_command(raw_args)
+
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
         from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model

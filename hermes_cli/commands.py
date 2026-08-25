@@ -344,6 +344,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                             "notify-list", "notify-unsubscribe", "log", "runs",
                             "heartbeat", "assignees", "context", "specify", "gc"),
                busy_policy="dispatch"),
+    CommandDef("kanban_status", "Browse live Kanban status one project at a time", "Tools & Skills",
+               gateway_only=True, aliases=("kanban-status",)),
+    CommandDef("newtask", "Start guided dev-team project task intake", "Tools & Skills",
+               gateway_only=True),
     CommandDef("reload", "Reload .env variables into the running session", "Tools & Skills",
                cli_only=True),
     CommandDef("reload-mcp", "Reload MCP servers from config", "Tools & Skills",
@@ -727,6 +731,8 @@ _TELEGRAM_MENU_PRIORITY = (
     "update",
     "verbose",
     "commands",
+    "kanban_status",
+    "newtask",
     # Mid-turn session control.
     "approve",
     "deny",
@@ -1368,7 +1374,12 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform"})
+#   - insights: low-frequency diagnostics/recovery surface; reachable as
+#     /hermes insights on Slack. Demoted when the dev-team /kanban_status and
+#     /newtask commands claimed native slots, preserving the 50-command cap.
+#   - usage: low-frequency token/cost summary; reachable as /hermes usage on
+#     Slack. Demoted for the second dev-team native command slot.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "usage"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

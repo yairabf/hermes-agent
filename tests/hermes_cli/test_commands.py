@@ -183,6 +183,16 @@ class TestTelegramBotCommands:
         assert "queue" in names
         assert "steer" in names
 
+    def test_restored_dev_team_commands_are_gateway_known_and_menu_visible(self):
+        """Gateway-only dev-team commands must remain visible in Telegram's capped menu."""
+        names = {name for name, _ in telegram_bot_commands()}
+        menu_names = [name for name, _ in telegram_menu_commands(max_commands=30)[0]]
+
+        assert "kanban_status" in names
+        assert "newtask" in names
+        assert "kanban_status" in menu_names
+        assert "newtask" in menu_names
+
 
 class TestSlackSubcommandMap:
     def test_returns_dict(self):

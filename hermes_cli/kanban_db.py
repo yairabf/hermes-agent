@@ -7510,13 +7510,21 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_status: Optional[str] = None,
+) -> bool:
+    """Archive a task, optionally only if its current status still matches."""
+    status_guard = " AND status = ?" if expected_status is not None else ""
+    params = (task_id, expected_status) if expected_status is not None else (task_id,)
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
-            (task_id,),
+            "WHERE id = ? AND status != 'archived'" + status_guard,
+            params,
         )
         if cur.rowcount != 1:
             return False

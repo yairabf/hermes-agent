@@ -16805,8 +16805,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (e.g. customer handover ingest) without triggering the pairing flow.
         if not is_internal:
             try:
+                from gateway.newtask import handle_pre_gateway_dispatch as _newtask_dispatch
+
+                _builtin_result = _newtask_dispatch(
+                    event=event,
+                    gateway=self,
+                    session_store=getattr(self, "session_store", None),
+                )
+                _hook_results = [_builtin_result] if isinstance(_builtin_result, dict) else []
+            except Exception as _builtin_exc:
+                logger.warning("built-in /newtask pre-dispatch failed: %s", _builtin_exc, exc_info=True)
+                _hook_results = []
+            try:
                 from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-                _hook_results = _invoke_hook(
+                _hook_results.extend(_invoke_hook(
                     "pre_gateway_dispatch",
                     event=event,
                     gateway=self,
@@ -16814,10 +16826,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # object.__new__ without __init__ (pitfall #17), and the
                     # hook must not fail dispatch over a missing attribute.
                     session_store=getattr(self, "session_store", None),
-                )
+                ))
             except Exception as _hook_exc:
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
-                _hook_results = []
 
             for _result in _hook_results:
                 if not isinstance(_result, dict):
@@ -17592,6 +17603,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     canonical = _cmd_def.name if _cmd_def else command
                     break
 
+        # Native /kanban_status delivery contains live Kanban data. Run it only
+        # after the standard command middleware has had the same opportunity to
+        # deny, handle, or rewrite the command as every other gateway command.
+        # The earlier pre_gateway_dispatch hook still runs first, so its skip or
+        # rewrite decisions are also reflected here without firing either hook
+        # twice.
+        if not is_internal and canonical == "kanban_status":
+            try:
+                from gateway.kanban_status import (
+                    handle_pre_gateway_dispatch as _status_dispatch,
+                )
+
+                _status_result = await _status_dispatch(event=event, gateway=self)
+                if isinstance(_status_result, dict):
+                    _status_action = _status_result.get("action")
+                    if _status_action == "skip":
+                        logger.info(
+                            "native /kanban_status handled: reason=%s platform=%s chat=%s",
+                            _status_result.get("reason"),
+                            source.platform.value if source.platform else "unknown",
+                            source.chat_id or "unknown",
+                        )
+                        return None
+                    if _status_action == "rewrite":
+                        _status_text = _status_result.get("text")
+                        if isinstance(_status_text, str):
+                            event = dataclasses.replace(event, text=_status_text)
+                            source = event.source
+            except Exception as _status_exc:
+                logger.warning(
+                    "built-in /kanban_status native dispatch failed: %s",
+                    _status_exc,
+                    exc_info=True,
+                )
+
         if canonical == "pause":
             return await self._handle_pause_command(event)
 
@@ -17744,6 +17790,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "kanban":
             return await self._handle_kanban_command(event)
+
+        if canonical == "kanban_status":
+            return await self._handle_kanban_status_command(event)
+
+        if canonical == "newtask":
+            return await self._handle_newtask_command(event)
 
         if canonical == "suggestions":
             return await self._handle_suggestions_command(event)

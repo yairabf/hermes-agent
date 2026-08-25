@@ -449,6 +449,21 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
 
 
 
+def test_archive_task_expected_status_is_atomic_guard(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="guarded archive")
+
+        assert kb.archive_task(conn, task_id, expected_status="done") is False
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+        conn.commit()
+        assert kb.archive_task(conn, task_id, expected_status="done") is True
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "archived"
+
+
 def test_delete_archived_task_removes_related_rows(kanban_home):
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
